@@ -1,0 +1,61 @@
+name: Export YOLO models (ONNX)
+
+# شغّل هذا الـ workflow مرة واحدة فقط. ينتج نماذج YOLO11 بصيغة ONNX
+# ويرفعها إلى إصدار باسم "models" ليحمّلها التطبيق من داخله.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ultralytics onnx onnxslim onnxruntime
+
+      - name: Export models
+        run: |
+          mkdir -p out
+          cd out
+          for spec in "yolo11n 320" "yolo11n 640" "yolo11s 320" "yolo11s 640" "yolo11m 640" "yolo11l 640" "yolo11x 640"; do
+            set -- $spec
+            yolo export model=$1.pt format=onnx imgsz=$2 simplify=True dynamic=False half=False
+            mv $1.onnx $1-$2.onnx
+          done
+          ls -la
+
+      - name: Verify exported models
+        run: |
+          python - <<'PY'
+          import glob, onnxruntime as ort
+          files = sorted(glob.glob('out/*.onnx'))
+          assert files, 'no onnx files exported'
+          for f in files:
+              s = ort.InferenceSession(f, providers=['CPUExecutionProvider'])
+              i = s.get_inputs()[0]
+              o = s.get_outputs()[0]
+              print(f, i.name, i.shape, '->', o.name, o.shape)
+              assert len(i.shape) == 4 and len(o.shape) == 3, 'unexpected tensor ranks'
+          PY
+
+      - name: Publish release "models"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: models
+          name: YOLO models (ONNX)
+          prerelease: true
+          files: out/*.onnx
