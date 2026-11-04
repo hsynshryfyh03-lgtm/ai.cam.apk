@@ -1,0 +1,217 @@
+name: ⬆️ Upload File From URL
+
+# ضع هذا الملف في المسار:  .github/workflows/upload-file.yml
+# ثم شغّله من تبويب Actions  ←  Upload File From URL  ←  Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "🔗 رابط التنزيل المباشر للملف (http/https)"
+        required: true
+        type: string
+      target_folder:
+        description: "📁 المجلد داخل المستودع (اتركه فارغاً للجذر) مثال: assets/images"
+        required: false
+        default: ""
+        type: string
+      file_name:
+        description: "🏷️ اسم الملف (اختياري — إن تُرك فارغاً يُستخرج تلقائياً من الرابط)"
+        required: false
+        default: ""
+        type: string
+      create_folder:
+        description: "➕ إنشاء المجلد إن لم يكن موجوداً"
+        required: false
+        default: false
+        type: boolean
+      overwrite:
+        description: "♻️ استبدال الملف إن كان موجوداً بنفس الاسم"
+        required: false
+        default: false
+        type: boolean
+      commit_message:
+        description: "💬 رسالة الـ commit (اختياري)"
+        required: false
+        default: ""
+        type: string
+
+# الصلاحية الوحيدة المطلوبة: الكتابة على المحتوى
+permissions:
+  contents: write
+
+# منع تشغيل عمليتين رفع في نفس الوقت (تفادياً لتعارض الـ push)
+concurrency:
+  group: upload-file-from-url
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Download & Commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⬇️ Download file & validate
+        env:
+          # تمرير المدخلات عبر متغيرات البيئة (وليس داخل السكربت) لمنع حقن الأوامر
+          FILE_URL: ${{ inputs.file_url }}
+          TARGET_FOLDER: ${{ inputs.target_folder }}
+          FILE_NAME: ${{ inputs.file_name }}
+          CREATE_FOLDER: ${{ inputs.create_folder }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -euo pipefail
+
+          MAX_BYTES=104857600   # 100MB = الحد الأقصى لحجم الملف في GitHub
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          # ---------- 1) التحقق من الرابط ----------
+          URL="$(printf '%s' "$FILE_URL" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          case "$URL" in
+            http://*|https://*) ;;
+            *) fail "الرابط غير صالح: يجب أن يبدأ بـ http:// أو https://" ;;
+          esac
+
+          # ---------- 2) تنظيف مسار المجلد ----------
+          FOLDER="$(printf '%s' "$TARGET_FOLDER" | tr '\\' '/' \
+            | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s#^(\./)+##; s#^/+##; s#/+$##')"
+          [ "$FOLDER" = "." ] && FOLDER=""
+
+          case "/$FOLDER/" in
+            */../*) fail "مسار المجلد غير مسموح (يحتوي على ..)" ;;
+            */.git/*) fail "لا يمكن الرفع داخل مجلد .git" ;;
+          esac
+
+          if [ -n "$FOLDER" ] && [ ! -d "$FOLDER" ]; then
+            if [ "$CREATE_FOLDER" = "true" ]; then
+              echo "📁 سيتم إنشاء المجلد: $FOLDER"
+            else
+              fail "المجلد '$FOLDER' غير موجود في المستودع. فعّل خيار (إنشاء المجلد) أو صحّح المسار."
+            fi
+          fi
+
+          # ---------- 3) تنزيل الملف ----------
+          TMP="$RUNNER_TEMP/download.tmp"
+          HEADERS="$RUNNER_TEMP/headers.txt"
+          echo "⬇️ جاري التنزيل..."
+          curl --fail --location --silent --show-error \
+               --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 1500 \
+               --max-filesize "$MAX_BYTES" \
+               -A "Mozilla/5.0 (GitHub-Actions-Uploader)" \
+               -D "$HEADERS" -o "$TMP" "$URL" \
+            || fail "فشل التنزيل. تأكد أن الرابط مباشر وعام وأن الملف لا يتجاوز 100MB."
+
+          SIZE="$(stat -c%s "$TMP")"
+          [ "$SIZE" -gt 0 ] || fail "الملف المُنزَّل فارغ."
+          [ "$SIZE" -le "$MAX_BYTES" ] || fail "حجم الملف يتجاوز 100MB (حد GitHub). استخدم Git LFS."
+
+          # ---------- 4) تحديد اسم الملف ----------
+          # الأولوية: المُدخل اليدوي ← Content-Disposition ← اسم الرابط
+          NAME="$(printf '%s' "$FILE_NAME" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+
+          if [ -z "$NAME" ]; then
+            NAME="$(python3 - "$HEADERS" <<'PY'
+          import re, sys, urllib.parse
+          txt = open(sys.argv[1], errors="ignore").read()
+          blocks = [b for b in re.split(r"\r?\n\r?\n", txt) if b.strip()]
+          last = blocks[-1] if blocks else ""
+          m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;\r\n]+)", last, re.I)
+          if m:
+              print(urllib.parse.unquote(m.group(1).strip().strip('"')))
+          else:
+              m = re.search(r'filename\s*=\s*"?([^";\r\n]+)"?', last, re.I)
+              if m:
+                  print(m.group(1).strip())
+          PY
+            )"
+          fi
+
+          if [ -z "$NAME" ]; then
+            CLEAN="${URL%%#*}"
+            CLEAN="${CLEAN%%\?*}"
+            NAME="$(basename "$CLEAN")"
+            NAME="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$NAME")"
+          fi
+
+          # منع أي مسارات داخل الاسم
+          NAME="$(basename "$(printf '%s' "$NAME" | tr '\\' '/')")"
+
+          case "$NAME" in
+            ""|"."|".."|".git") fail "تعذّر تحديد اسم صالح للملف. أدخل الاسم يدوياً في خانة (اسم الملف)." ;;
+          esac
+
+          # ---------- 5) تحذير إن كان الملف صفحة HTML بدل الملف الحقيقي ----------
+          case "${NAME,,}" in
+            *.html|*.htm) ;;
+            *)
+              if head -c 1024 "$TMP" | grep -qiE '<!doctype html|<html'; then
+                echo "::warning::يبدو أن الرابط يعيد صفحة HTML وليس الملف نفسه (قد لا يكون رابطاً مباشراً)."
+              fi
+              ;;
+          esac
+
+          # ---------- 6) المسار النهائي والتحقق من التكرار ----------
+          DEST="${FOLDER:+$FOLDER/}$NAME"
+
+          if [ -e "$DEST" ] && [ "$OVERWRITE" != "true" ]; then
+            fail "الملف '$DEST' موجود مسبقاً. فعّل خيار (الاستبدال) أو غيّر الاسم."
+          fi
+
+          [ -n "$FOLDER" ] && mkdir -p -- "$FOLDER"
+          mv -f -- "$TMP" "$DEST"
+
+          echo "DEST_PATH=$DEST" >> "$GITHUB_ENV"
+          echo "FILE_SIZE=$SIZE" >> "$GITHUB_ENV"
+          echo "✅ تم تجهيز الملف: $DEST ($SIZE bytes)"
+
+      - name: 🚀 Commit & Push
+        env:
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f -- "$DEST_PATH"
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ لا توجد تغييرات (الملف مطابق للموجود مسبقاً). لا حاجة لـ commit."
+            echo "### ℹ️ لا تغييرات — الملف \`$DEST_PATH\` مطابق للنسخة الموجودة." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          MSG="$(printf '%s' "$COMMIT_MESSAGE" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          [ -n "$MSG" ] || MSG="Add $DEST_PATH"
+
+          git commit -m "$MSG"
+
+          # محاولات متعددة للدفع في حال وجود تغييرات جديدة على الفرع
+          for attempt in 1 2 3; do
+            git pull --rebase --autostash origin "$GITHUB_REF_NAME" || true
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              break
+            fi
+            [ "$attempt" -lt 3 ] || { echo "::error::فشل الدفع بعد 3 محاولات."; exit 1; }
+            sleep 3
+          done
+
+      - name: 📋 Summary
+        if: success()
+        run: |
+          {
+            echo "### ✅ تم رفع الملف بنجاح"
+            echo ""
+            echo "| العنصر | القيمة |"
+            echo "|---|---|"
+            echo "| 📄 المسار | \`$DEST_PATH\` |"
+            echo "| 📦 الحجم | $FILE_SIZE bytes |"
+            echo "| 🌿 الفرع | \`$GITHUB_REF_NAME\` |"
+            echo ""
+            echo "🔗 [فتح الملف]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/$DEST_PATH)"
+          } >> "$GITHUB_STEP_SUMMARY"
