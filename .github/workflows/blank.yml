@@ -1,0 +1,43 @@
+name: Unzip project
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "اسم الملف المضغوط في جذر المستودع"
+        default: "SentinelAI-v2_1.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract and commit
+        env:
+          ZIP: ${{ github.event.inputs.zip }}
+        run: |
+          set -e
+          test -f "$ZIP" || { echo "::error::الملف $ZIP غير موجود في جذر المستودع"; exit 1; }
+          rm -rf /tmp/x && mkdir /tmp/x
+          unzip -q "$ZIP" -d /tmp/x
+          src=/tmp/x
+          if [ "$(ls -A /tmp/x | wc -l)" = "1" ] && [ -d "/tmp/x/$(ls -A /tmp/x)" ]; then
+            src="/tmp/x/$(ls -A /tmp/x)"
+          fi
+          if [ -f "$src/.github/workflows/convert-pt.yml" ]; then
+            cp "$src/.github/workflows/convert-pt.yml" /tmp/convert-pt.yml
+          fi
+          rm -rf "$src/.github"
+          cp -a "$src"/. ./
+          if [ -f /tmp/convert-pt.yml ]; then cp /tmp/convert-pt.yml ./convert-pt.yml; fi
+          git rm -q --ignore-unmatch -f "$ZIP"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unzip $ZIP" || { echo "لا تغييرات"; exit 0; }
+          git push
